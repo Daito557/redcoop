@@ -6,6 +6,7 @@ on:
     paths:
       - 'redcoop_gui.py'
       - 'requirements.txt'
+      - 'redcoop_logo.ico'
       - '.github/workflows/build-windows-exe.yml'
   workflow_dispatch: {}
 
@@ -26,7 +27,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --name redcoop-gui redcoop_gui.py
+        run: pyinstaller --onefile --name redcoop-gui --icon redcoop_logo.ico redcoop_gui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
