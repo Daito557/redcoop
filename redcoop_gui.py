@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # REDCoop - application graphique (remplace redcoop_client.py + la ligne de
 # commande). Plus aucun argument a taper/mal orthographier - le dossier du
@@ -19,6 +20,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -87,17 +89,19 @@ class RedcoopClient:
     des positions, nettoyage a la deconnexion), packagee comme une classe
     pilotable (start/stop) plutot qu'un script a arguments."""
 
-    def __init__(self, mod_dir, name, room, log_fn):
+    def __init__(self, mod_dir, name, room, log_fn, ping_fn=None):
         self.mod_dir = mod_dir
         self.name = name
         self.room = room
         self.log = log_fn
+        self.ping_fn = ping_fn or (lambda rtt_ms: None)
         self.log_path = os.path.join(mod_dir, "REDCoop.log")
         self.friend_pos_path = os.path.join(mod_dir, "friend_pos.json")
         self.own_outfit_path = os.path.join(mod_dir, "own_outfit.json")
         self.friend_outfit_path = os.path.join(mod_dir, "friend_outfit.json")
         self.own_vehicle_path = os.path.join(mod_dir, "own_vehicle.json")
         self.friend_vehicle_path = os.path.join(mod_dir, "friend_vehicle.json")
+        self.own_ping_path = os.path.join(mod_dir, "own_ping.json")
         self._stop = False
         self._ws = None
 
@@ -139,6 +143,17 @@ class RedcoopClient:
             await ws.send(json.dumps({"type": "pos", "x": x, "y": y, "z": z, "outfit": outfit, "vehicle": vehicle}))
             self.log(f"envoye: x={x} y={y} z={z}")
 
+    async def _pinger(self, ws):
+        # Mesure la latence vers le relais - un simple aller-retour toutes
+        # les 5s, jamais diffuse a l'autre joueur (voir index.js: le "pong"
+        # est renvoye uniquement a l'expediteur).
+        while not self._stop:
+            try:
+                await ws.send(json.dumps({"type": "ping", "ts": time.time()}))
+            except Exception:
+                return
+            await asyncio.sleep(5)
+
     async def _receiver(self, ws):
         async for raw in ws:
             try:
@@ -154,6 +169,17 @@ class RedcoopClient:
             elif msg.get("type") == "leave":
                 self.log(f"{msg.get('from')} s'est deconnecte, effacement de ses donnees")
                 self._clear_friend_data()
+            elif msg.get("type") == "pong":
+                try:
+                    rtt_ms = int((time.time() - float(msg["ts"])) * 1000)
+                except (TypeError, KeyError, ValueError):
+                    continue
+                self.ping_fn(rtt_ms)
+                # Own ping to the relay, written for init.lua to read - a
+                # reasonable proxy for how stale THIS client's incoming
+                # friend-position samples might be, used to widen the
+                # vehicle extrapolation window when the connection is laggy.
+                write_json_atomic(self.own_ping_path, {"rtt_ms": rtt_ms})
 
     async def run(self):
         self.log(f"demarrage - dossier: {self.mod_dir}")
@@ -163,12 +189,13 @@ class RedcoopClient:
                     self._ws = ws
                     await ws.send(json.dumps({"type": "hello", "name": self.name, "room": self.room}))
                     self.log(f"connecte au relais sous '{self.name}', salle '{self.room}'")
-                    await asyncio.gather(self._sender(ws), self._receiver(ws))
+                    await asyncio.gather(self._sender(ws), self._receiver(ws), self._pinger(ws))
             except Exception as e:
                 if self._stop:
                     break
                 self.log(f"connexion perdue ({e}), nouvelle tentative dans 3s...")
                 self._clear_friend_data()
+                self.ping_fn(None)
                 await asyncio.sleep(3)
             finally:
                 self._ws = None
@@ -260,6 +287,8 @@ class App:
         self.stop_btn.pack(side="left", padx=(6, 0))
         self.status_var = tk.StringVar(value="● ARRETE")
         ttk.Label(btn_row, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=(16, 0))
+        self.ping_var = tk.StringVar(value="ping: --")
+        ttk.Label(btn_row, textvariable=self.ping_var, style="Status.TLabel").pack(side="left", padx=(16, 0))
 
         update_row = ttk.Frame(outer)
         update_row.pack(fill="x", pady=(0, 14))
@@ -284,6 +313,7 @@ class App:
         self.loop = None
         self._lock_path = None
         self.log_queue = queue.Queue()
+        self.ping_queue = queue.Queue()
         root.after(150, self._drain_log_queue)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -298,6 +328,11 @@ class App:
         # _drain_log_queue() (qui tourne dans le thread principal) l'affiche.
         self.log_queue.put(msg)
 
+    def _on_ping(self, rtt_ms):
+        # Meme regle que log() ci-dessus : appele depuis le thread reseau,
+        # on passe par une queue plutot que de toucher ping_var directement.
+        self.ping_queue.put(rtt_ms)
+
     def _drain_log_queue(self):
         while True:
             try:
@@ -308,6 +343,12 @@ class App:
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
+        while True:
+            try:
+                rtt_ms = self.ping_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.ping_var.set(f"ping: {rtt_ms} ms" if rtt_ms is not None else "ping: --")
         self.root.after(150, self._drain_log_queue)
 
     def install_update(self):
@@ -374,7 +415,7 @@ class App:
 
         save_config({"mod_dir": mod_dir, "name": name, "room": room})
 
-        self.client = RedcoopClient(mod_dir, name, room, self.log)
+        self.client = RedcoopClient(mod_dir, name, room, self.log, ping_fn=self._on_ping)
         self.thread = threading.Thread(target=self._run_client_thread, daemon=True)
         self.thread.start()
 
@@ -406,6 +447,7 @@ class App:
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("● ARRETE")
+        self.ping_var.set("ping: --")
 
     def on_close(self):
         self.stop()
